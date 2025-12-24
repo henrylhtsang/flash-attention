@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source ~/.bashrc)",
+      "Bash(conda activate flash)",
+      "Bash(python /home/henrylhtsang/paged.py:*)",
+      "Bash(source:*)",
+      "Bash(conda run:*)",
+      "Bash(CUDA_LAUNCH_BLOCKING=1 conda run:*)",
+      "Bash(git stash:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(CUDA_LAUNCH_BLOCKING=1 python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

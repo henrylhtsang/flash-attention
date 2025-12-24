@@ -370,7 +370,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         compute_capability,
-        page_size not in [None, 128],  # paged KV non-TMA
+        page_size,  # paged KV page size
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -462,7 +462,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
+                page_size=page_size,
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
             )
