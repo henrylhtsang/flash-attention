@@ -657,17 +657,17 @@ def _flash_attn_fwd(
 
     # Auto-detect TMA-paged KV: use TMA for paged KV when page count per
     # n-block is a small power of two and head_dim is 128B-swizzle aligned.
-    _pages_per_nblock = (
+    pages_per_nblock = (
         tile_n // page_size
         if page_size is not None and page_size < tile_n and tile_n % page_size == 0
         else 0
     )
-    _elem_sz = q.element_size()
-    _use_tma_paged = (
+    elem_sz = q.element_size()
+    use_tma_paged = (
         arch // 10 in [10, 11]
-        and _pages_per_nblock in (2, 4, 8)
-        and (head_dim * _elem_sz) % 128 == 0
-        and (head_dim_v * _elem_sz) % 128 == 0
+        and pages_per_nblock in (2, 4, 8)
+        and (head_dim * elem_sz) % 128 == 0
+        and (head_dim_v * elem_sz) % 128 == 0
         and head_dim == head_dim_v             # uneven KV SMEM staging not supported
     )
 
@@ -698,9 +698,9 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, tile_n] and not _use_tma_paged,  # paged KV non-TMA
-        _use_tma_paged,
-        page_size if _use_tma_paged else None,
+        page_size not in [None, tile_n] and not use_tma_paged,  # paged KV non-TMA
+        use_tma_paged,
+        page_size if use_tma_paged else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -809,8 +809,8 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=False if _use_tma_paged else (page_size not in [None, tile_n]),
-                paged_kv_page_size=page_size if _use_tma_paged else 0,
+                paged_kv_non_tma=False if use_tma_paged else (page_size not in [None, tile_n]),
+                paged_kv_page_size=page_size if use_tma_paged else 0,
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
@@ -844,7 +844,7 @@ def _flash_attn_fwd(
             )
         # TODO: check @can_implement
         tma_paged_compile_tensors = []
-        if _use_tma_paged:
+        if use_tma_paged:
             if is_fake_mode():
                 # Fake mode: create placeholder tensors for type inference only
                 tmap_K = torch.empty(16, dtype=torch.int64, device=device)
@@ -897,7 +897,7 @@ def _flash_attn_fwd(
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     tma_paged_runtime_tensors = []
-    if _use_tma_paged and not is_fake_mode():
+    if use_tma_paged and not is_fake_mode():
         cache_key = (device, k.data_ptr(), v.data_ptr(), k.shape, v.shape, k.dtype, v.dtype)
         if not hasattr(_flash_attn_fwd, "_tma_paged_cache"):
             _flash_attn_fwd._tma_paged_cache = {}
