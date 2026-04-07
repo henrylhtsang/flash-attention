@@ -668,6 +668,7 @@ def _flash_attn_fwd(
         and _pages_per_nblock in (2, 4, 8)
         and (head_dim * _elem_sz) % 128 == 0
         and (head_dim_v * _elem_sz) % 128 == 0
+        and head_dim == head_dim_v             # uneven KV SMEM staging not supported
     )
 
     compile_key = (
