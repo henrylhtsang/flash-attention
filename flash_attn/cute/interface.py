@@ -845,16 +845,21 @@ def _flash_attn_fwd(
         # TODO: check @can_implement
         tma_paged_compile_tensors = []
         if _use_tma_paged:
-            elem_size = q.element_size()
-            total_rows = k.shape[0] * k.shape[1]
-            tmap_K = _create_tma_paged_descriptor(
-                k.data_ptr(), k.dtype, head_dim, num_head_kv,
-                page_size, total_rows, k.shape[2] * k.shape[3] * elem_size, device,
-            )
-            tmap_V = _create_tma_paged_descriptor(
-                v.data_ptr(), v.dtype, head_dim_v, num_head_kv,
-                page_size, total_rows, v.shape[2] * v.shape[3] * elem_size, device,
-            )
+            if is_fake_mode():
+                # Fake mode: create placeholder tensors for type inference only
+                tmap_K = torch.empty(16, dtype=torch.int64, device=device)
+                tmap_V = torch.empty(16, dtype=torch.int64, device=device)
+            else:
+                elem_size = q.element_size()
+                total_rows = k.shape[0] * k.shape[1]
+                tmap_K = _create_tma_paged_descriptor(
+                    k.data_ptr(), k.dtype, head_dim, num_head_kv,
+                    page_size, total_rows, k.shape[2] * k.shape[3] * elem_size, device,
+                )
+                tmap_V = _create_tma_paged_descriptor(
+                    v.data_ptr(), v.dtype, head_dim_v, num_head_kv,
+                    page_size, total_rows, v.shape[2] * v.shape[3] * elem_size, device,
+                )
             K_ptr_tensor = torch.tensor([tmap_K.data_ptr()], dtype=torch.int64, device=device)
             V_ptr_tensor = torch.tensor([tmap_V.data_ptr()], dtype=torch.int64, device=device)
             tma_paged_compile_tensors = [
