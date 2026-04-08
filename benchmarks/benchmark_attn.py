@@ -140,12 +140,22 @@ def setup_fa4(ctx):
     sinks = ctx["sinks"]
     k_use = ctx.get("k_paged", k) if ctx["page_size"] is not None else k
     v_use = ctx.get("v_paged", v) if ctx["page_size"] is not None else v
-    if ctx["varlen"]:
-        qu = ctx["q_unpad"]
-        ku = ctx.get("k_paged", ctx["k_unpad"]) if ctx["page_size"] is not None else ctx["k_unpad"]
-        vu = ctx.get("v_paged", ctx["v_unpad"]) if ctx["page_size"] is not None else ctx["v_unpad"]
-        csq, csk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"]
-        pt = ctx["page_table"]
+    is_paged = ctx["page_size"] is not None
+    if ctx["varlen"] or is_paged:
+        # Paged KV requires varlen interface
+        if ctx["varlen"]:
+            qu = ctx["q_unpad"]
+        else:
+            qu = rearrange(q.detach(), "b s h d -> (b s) h d")
+        ku = ctx.get("k_paged", ctx.get("k_unpad", k)) if is_paged else ctx.get("k_unpad", k)
+        vu = ctx.get("v_paged", ctx.get("v_unpad", v)) if is_paged else ctx.get("v_unpad", v)
+        csq = ctx.get("cu_seqlens_q")
+        if csq is None:
+            batch_size = q.shape[0]
+            seqlen_q = q.shape[1]
+            csq = torch.arange(batch_size + 1, device=q.device, dtype=torch.int32) * seqlen_q
+        csk = ctx.get("cu_seqlens_k")
+        pt = ctx.get("page_table")
         fwd_fn = lambda: flash_attn_varlen_func_python(qu, ku, vu, csq, csk, page_table=pt, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa)
     else:
         fwd_fn = lambda: flash_attn_func_python(q, k_use, v_use, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa)
@@ -277,10 +287,14 @@ def parse_args():
                         help='GQA ratio (nheads // nheads_kv). Ignored if --nheads-kv is set.')
     parser.add_argument('--backend', type=csv_strs, default=['all'],
                         help='Which backends to benchmark, comma-separated (choices: all,standard,fa2,fa3,fa4,cudnn)')
+    parser.add_argument('--page-size', type=csv_ints, default=None,
+                        help='Page size(s) for paged KV, comma-separated (e.g. 128,64,32,16). None means no paging.')
     parser.add_argument('--warmup', type=int, default=5,
                         help='Warmup iterations (default: 5)')
     parser.add_argument('--rep', type=int, default=10,
                         help='Repetitions per benchmark (default: 10)')
+    parser.add_argument('--decode', action='store_true', default=False,
+                        help='Run decode configs (seqlen_q=1, large batch, GQA)')
     return parser.parse_args()
 
 
@@ -317,10 +331,11 @@ def main():
     dtype_gen = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     device = 'cuda'
     peak_flops = get_peak_flops(0, dtype=dtype)
-    page_size = None
+    page_size_list = args.page_size if args.page_size is not None else [None]
     softcap = 0.0
     deterministic = args.deterministic
     warmup, rep = args.warmup, args.rep
+    decode = args.decode
 
     time_f = {}
     time_b = {}
@@ -343,7 +358,7 @@ def main():
 
         for seqlen in seqlen_list:
             batch_size = args.batch_size if args.batch_size is not None else max(1, args.total_seqlen // seqlen)
-            seqlen_q = seqlen
+            seqlen_q = 1 if decode else seqlen
 
             q = torch.randn(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype_gen, requires_grad=has_backward)
             k = torch.randn(batch_size, seqlen, nheads_kv, headdim, device=device, dtype=dtype_gen, requires_grad=has_backward)
@@ -357,45 +372,51 @@ def main():
                 q_unpad, k_unpad, v_unpad = [rearrange(x.detach(), "b s h d -> (b s) h d").requires_grad_(has_backward) for x in [q, k, v]]
                 g_unpad = rearrange(g.detach(), "b s h d -> (b s) h d")
                 cu_seqlens_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
-                cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen if page_size is None else None
 
-            # Paged KV tensors
-            k_paged = v_paged = page_table = None
-            if page_size is not None:
-                assert seqlen % page_size == 0
-                k_paged, v_paged = [rearrange(x, "b (n p) h d -> (b n) p h d", p=page_size) for x in [k, v]]
-                page_table = rearrange(torch.arange(batch_size * seqlen // page_size, device=device, dtype=torch.int32),
-                                       "(b s) -> b s", s=seqlen // page_size)
+            for page_size in page_size_list:
+                # Paged KV tensors
+                k_paged = v_paged = page_table = None
+                if page_size is not None:
+                    if seqlen % page_size != 0:
+                        continue
+                    k_paged, v_paged = [rearrange(x, "b (n p) h d -> (b n) p h d", p=page_size) for x in [k, v]]
+                    page_table = rearrange(torch.arange(batch_size * seqlen // page_size, device=device, dtype=torch.int32),
+                                           "(b s) -> b s", s=seqlen // page_size)
 
-            for causal in causal_vals:
-                cfg = (headdim, headdim_v, causal, seqlen, batch_size, nheads)
+                cu_seqlens_k_use = None
+                if varlen and page_size is None:
+                    cu_seqlens_k_use = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen
 
-                # Build context dict shared by all backends
-                ctx = dict(
-                    q=q, k=k, v=v, g=g, causal=causal,
-                    headdim=headdim, headdim_v=headdim_v, dtype=dtype,
-                    has_backward=has_backward,
-                    varlen=varlen, q_unpad=q_unpad, k_unpad=k_unpad, v_unpad=v_unpad, g_unpad=g_unpad,
-                    cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                    seqlen_q=seqlen_q, seqlen=seqlen,
-                    page_size=page_size, k_paged=k_paged, v_paged=v_paged, page_table=page_table,
-                    dropout_p=dropout_p, window_size=window_size, window_size_fa=window_size_fa,
-                    softcap=softcap, deterministic=deterministic,
-                    num_splits=num_splits, pack_gqa=pack_gqa, sinks=sinks,
-                )
+                for causal in causal_vals:
+                    ps_str = f"pg{page_size}" if page_size is not None else "nopg"
+                    cfg = (headdim, headdim_v, causal, seqlen, batch_size, nheads, page_size)
 
-                for display_name, cli_name, setup_fn in active_backends:
-                    fwd_fn, bwd_fn = setup_fn(ctx)
-                    if fwd_fn is not None and has_forward:
-                        time.sleep(1.0)
-                        print(f"Benchmarking {display_name} fwd, hdim={headdim}, seqlen={seqlen}, causal={causal}, {nheads=}, {nheads_kv=}")
-                        ms = do_bench(fwd_fn, warmup=warmup, rep=rep) * 1e-3
-                        time_f[cfg, display_name] = ms
-                    if bwd_fn is not None and has_backward:
-                        time.sleep(1.0)
-                        print(f"Benchmarking {display_name} bwd, hdim={headdim}, seqlen={seqlen}, causal={causal}, {nheads=}, {nheads_kv=}, {deterministic=}")
-                        ms = do_bench(bwd_fn, warmup=warmup, rep=rep) * 1e-3
-                        time_b[cfg, display_name] = ms
+                    # Build context dict shared by all backends
+                    ctx = dict(
+                        q=q, k=k, v=v, g=g, causal=causal,
+                        headdim=headdim, headdim_v=headdim_v, dtype=dtype,
+                        has_backward=has_backward,
+                        varlen=varlen, q_unpad=q_unpad, k_unpad=k_unpad, v_unpad=v_unpad, g_unpad=g_unpad,
+                        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k_use,
+                        seqlen_q=seqlen_q, seqlen=seqlen,
+                        page_size=page_size, k_paged=k_paged, v_paged=v_paged, page_table=page_table,
+                        dropout_p=dropout_p, window_size=window_size, window_size_fa=window_size_fa,
+                        softcap=softcap, deterministic=deterministic,
+                        num_splits=num_splits, pack_gqa=pack_gqa, sinks=sinks,
+                    )
+
+                    for display_name, cli_name, setup_fn in active_backends:
+                        fwd_fn, bwd_fn = setup_fn(ctx)
+                        if fwd_fn is not None and has_forward:
+                            time.sleep(1.0)
+                            print(f"Benchmarking {display_name} fwd, hdim={headdim}, seqlen={seqlen}, {ps_str}, causal={causal}, {nheads=}, {nheads_kv=}")
+                            ms = do_bench(fwd_fn, warmup=warmup, rep=rep) * 1e-3
+                            time_f[cfg, display_name] = ms
+                        if bwd_fn is not None and has_backward:
+                            time.sleep(1.0)
+                            print(f"Benchmarking {display_name} bwd, hdim={headdim}, seqlen={seqlen}, {ps_str}, causal={causal}, {nheads=}, {nheads_kv=}, {deterministic=}")
+                            ms = do_bench(bwd_fn, warmup=warmup, rep=rep) * 1e-3
+                            time_b[cfg, display_name] = ms
 
     # ── Print results table ──────────────────────────────────────────────────
     backend_names = [name for name, _, _ in BACKENDS]
@@ -414,7 +435,7 @@ def main():
             continue
 
         col_label = "ms / TFLOPS / MFU%" if peak_flops is not None else "ms / TFLOPS"
-        header = f"{'hdim':>9} {'causal':>6} {'batch':>5} {'seqlen':>6}"
+        header = f"{'hdim':>9} {'causal':>6} {'batch':>5} {'seqlen':>6} {'page':>5}"
         for b in shown_backends:
             header += f" {b:>{col_w}}"
         print(f"\n{'=' * len(header)}")
@@ -424,10 +445,12 @@ def main():
         print("-" * len(header))
 
         for cfg in configs:
-            headdim, headdim_v, causal, seqlen, batch_size, nheads = cfg
-            nFLOPS = flops(batch_size, nheads, seqlen, seqlen, headdim, headdim_v, causal=causal)
+            headdim, headdim_v, causal, seqlen, batch_size, nheads, pg_size = cfg
+            seqlen_q = 1 if decode else seqlen
+            nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim, headdim_v, causal=causal)
             hdim_str = str(headdim) if headdim == headdim_v else f"{headdim}-{headdim_v}"
-            row = f"{hdim_str:>9} {str(causal):>6} {batch_size:>5} {seqlen:>6}"
+            pg_str = str(pg_size) if pg_size is not None else "-"
+            row = f"{hdim_str:>9} {str(causal):>6} {batch_size:>5} {seqlen:>6} {pg_str:>5}"
             for b in shown_backends:
                 t = times.get((cfg, b))
                 if t is not None:
