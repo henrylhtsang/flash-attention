@@ -260,7 +260,9 @@ def test_flash_attn_output(
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+            learnable_sink = torch.randn(
+                nheads, dtype=torch.bfloat16, device=device, requires_grad=True
+            )
         else:
             learnable_sink = None
         if dtype == torch.float8_e4m3fn:
@@ -386,7 +388,6 @@ def test_flash_attn_output(
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
             )
-            and learnable_sink is None
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
@@ -396,7 +397,10 @@ def test_flash_attn_output(
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-            dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+            grad_inputs = (q, k, v) if learnable_sink is None else (q, k, v, learnable_sink)
+            grads = torch.autograd.grad(out, grad_inputs, g)
+            dq, dk, dv = grads[:3]
+            dsink = grads[3] if learnable_sink is not None else None
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
                 # skip data-dependent postprocessing
@@ -414,10 +418,18 @@ def test_flash_attn_output(
             # breakpoint()
 
             # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-            dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-                out_ref, (q_ref, k_ref, v_ref), g
+            ref_inputs = (
+                (q_ref, k_ref, v_ref)
+                if learnable_sink is None
+                else (q_ref, k_ref, v_ref, learnable_sink)
             )
-            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+            grads_ref = torch.autograd.grad(out_ref, ref_inputs, g, retain_graph=learnable_sink is not None)
+            grads_pt = torch.autograd.grad(out_pt, ref_inputs, g)
+            dq_ref, dk_ref, dv_ref = grads_ref[:3]
+            dq_pt, dk_pt, dv_pt = grads_pt[:3]
+            if learnable_sink is not None:
+                dsink_ref, dsink_pt = grads_ref[3], grads_pt[3]
+                print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
             print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
             print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
             print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -469,6 +481,13 @@ def test_flash_attn_output(
             assert (dv - dv_ref).abs().max().item() <= rtol * (
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
+            if learnable_sink is not None:
+                dsink_atol = 2 * (
+                    dsink_ref + 0.3 - 0.3 - dsink_ref
+                ).abs().max().item()
+                assert (dsink - dsink_ref).abs().max().item() <= rtol * (
+                    dsink_pt - dsink_ref
+                ).abs().max().item() + dsink_atol
 
 
 # Regression test for #2591: SMEM overflow at small head_dims on SM100. The main
